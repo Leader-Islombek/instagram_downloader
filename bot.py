@@ -15,14 +15,12 @@ from telegram.ext import (
     filters,
 )
 
-
-
 # ====== Load env ======
 load_dotenv()
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 IG_USER = os.getenv("IG_USER")
 IG_PASS = os.getenv("IG_PASS")
-ADMIN_IDS_RAW = os.getenv("ADMIN_IDS")
+ADMIN_IDS_RAW = os.getenv("ADMIN_IDS", "")
 ADMIN_IDS = [int(x.strip()) for x in ADMIN_IDS_RAW.split(",") if x.strip()]
 
 if not BOT_TOKEN or not IG_USER or not IG_PASS:
@@ -30,6 +28,8 @@ if not BOT_TOKEN or not IG_USER or not IG_PASS:
 
 # ====== Database (PostgreSQL) ======
 DB_URL = os.getenv("DATABASE_URL")
+if not DB_URL:
+    raise SystemExit("DATABASE_URL not set in .env")
 
 def init_db():
     conn = psycopg2.connect(DB_URL)
@@ -86,16 +86,16 @@ def get_logs(limit=100):
 def get_links(limit=100):
     conn = psycopg2.connect(DB_URL)
     cur = conn.cursor()
+    # Eng so'nggi unique linklarni olish uchun to'g'ri so'rov
     cur.execute("""
-        SELECT DISTINCT ON (link) link
-        FROM logs
-        ORDER BY link, id DESC
+        SELECT link FROM logs
+        GROUP BY link
+        ORDER BY MAX(id) DESC
         LIMIT %s
     """, (limit,))
     rows = [r[0] for r in cur.fetchall()]
     conn.close()
     return rows
-
 
 # ====== Instagram client ======
 cl = Client()
@@ -130,21 +130,17 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     
-    # Oddiy foydalanuvchi komandalar
     help_text = (
         "/start - Botni boshlash\n"
         "/help - Yordam\n"
     )
-
-    # Agar foydalanuvchi admin bo'lsa, qo'shimcha buyruqlar ham chiqadi
-    if user_id in ADMIN_IDS:
+    if is_admin(user_id):
         help_text += (
             "\n--- Admin komandalar ---\n"
             "/stats - Umumiy statistika\n"
             "/logs - Oxirgi loglar\n"
             "/links - Oxirgi linklar\n"
         )
-    
     await update.message.reply_text(help_text)
 
 async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -209,15 +205,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         caption_text = f"📄 Caption:\n{caption or '(yo‘q)'}\n\n🏷 Hashtags: {' '.join(hashtags) if hashtags else 'Yo‘q'}\n👤 Mentions: {' '.join(mentions) if mentions else 'Yo‘q'}"
 
         # Send media first
-        # media_type: 1 = photo, 2 = video, 8 = album
         if info.media_type == 2:  # video
-            await update.message.reply_text("🎬 Video yuborilmoqda...")
             await update.message.reply_video(video=str(info.video_url))
         elif info.media_type == 1:  # photo
-            await update.message.reply_text("🖼 Rasm yuborilmoqda...")
             await update.message.reply_photo(photo=str(info.thumbnail_url))
         elif info.media_type == 8:  # album
-            await update.message.reply_text("📦 Album. Media elementlari yuborilmoqda...")
             for res in info.resources:
                 if res.media_type == 2:
                     await update.message.reply_video(video=str(res.video_url))
@@ -226,7 +218,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             await update.message.reply_text("❌ Noma'lum media turi. Faqat rasm/video/album qo‘llanadi.")
 
-        # Then send caption + tags
+        # Send caption + tags
         await update.message.reply_text(caption_text)
         await msg.delete()
 
