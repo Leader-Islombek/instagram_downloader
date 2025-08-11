@@ -5,7 +5,8 @@ import psycopg2
 from psycopg2.extras import DictCursor
 from datetime import datetime
 from dotenv import load_dotenv
-from instagrapi import Client
+import instaloader
+from urllib.parse import urlparse
 from telegram import Update
 from telegram.ext import (
     ApplicationBuilder,
@@ -18,13 +19,11 @@ from telegram.ext import (
 # ====== Load env ======
 load_dotenv()
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-IG_USER = os.getenv("IG_USER")
-IG_PASS = os.getenv("IG_PASS")
 ADMIN_IDS_RAW = os.getenv("ADMIN_IDS", "")
 ADMIN_IDS = [int(x.strip()) for x in ADMIN_IDS_RAW.split(",") if x.strip()]
 
-if not BOT_TOKEN or not IG_USER or not IG_PASS:
-    raise SystemExit("Missing TELEGRAM_BOT_TOKEN, IG_USER or IG_PASS in .env")
+if not BOT_TOKEN:
+    raise SystemExit("Missing TELEGRAM_BOT_TOKEN in .env")
 
 # ====== Database (PostgreSQL) ======
 DB_URL = os.getenv("DATABASE_URL")
@@ -86,7 +85,6 @@ def get_logs(limit=100):
 def get_links(limit=100):
     conn = psycopg2.connect(DB_URL)
     cur = conn.cursor()
-    # Eng so'nggi unique linklarni olish uchun to'g'ri so'rov
     cur.execute("""
         SELECT link FROM logs
         GROUP BY link
@@ -96,15 +94,6 @@ def get_links(limit=100):
     rows = [r[0] for r in cur.fetchall()]
     conn.close()
     return rows
-
-# ====== Instagram client ======
-cl = Client()
-try:
-    cl.login(IG_USER, IG_PASS)
-    print("✅ Instagram login OK")
-except Exception as e:
-    print("❌ Instagram login error:", e)
-    raise SystemExit(1)
 
 # ====== Helpers ======
 URL_RE = re.compile(r"(https?://[^\s]+)")
@@ -121,15 +110,57 @@ def extract_tags_and_mentions(caption: str):
 def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
 
+def get_shortcode_from_url(url):
+    path = urlparse(url).path
+    parts = path.strip('/').split('/')
+    if len(parts) >= 2:
+        return parts[1]
+    return None
+
+def get_instagram_post_info(url):
+    L = instaloader.Instaloader()
+    shortcode = get_shortcode_from_url(url)
+    if not shortcode:
+        raise Exception("URL dan shortcode olinmadi")
+
+    post = instaloader.Post.from_shortcode(L.context, shortcode)
+
+    caption = post.caption or ""
+    hashtags, mentions = extract_tags_and_mentions(caption)
+
+    media_type = "photo"
+    media_urls = []
+
+    if post.is_video:
+        media_type = "video"
+        media_urls.append(post.video_url)
+    elif post.typename == "GraphSidecar":
+        media_type = "album"
+        for node in post.get_sidecar_nodes():
+            if node.is_video:
+                media_urls.append(node.video_url)
+            else:
+                media_urls.append(node.display_url)
+    else:
+        media_urls.append(post.url)
+
+    return {
+        "media_type": media_type,
+        "media_urls": media_urls,
+        "caption": caption,
+        "hashtags": hashtags,
+        "mentions": mentions,
+    }
+
 # ====== Handlers ======
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "👋 Salom! Instagram link yuboring (post yoki reel). Men avval media — keyin caption yuboraman."
+        "👋 Salom! Instagram link yuboring (post yoki reel). Men media va captionni yuboraman."
     )
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    
+
     help_text = (
         "/start - Botni boshlash\n"
         "/help - Yordam\n"
@@ -194,31 +225,29 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     msg = await update.message.reply_text("🔎 Instagram ma'lumot olinayapti... iltimos kuting")
     try:
-        media_pk = cl.media_pk_from_url(url)
-        info = cl.media_info(media_pk)
+        info = get_instagram_post_info(url)
 
-        # log it
-        add_log(user.id, user.username or "", user.first_name or "", url, str(media_pk))
+        add_log(user.id, user.username or "", user.first_name or "", url, "")
 
-        caption = info.caption_text or ""
-        hashtags, mentions = extract_tags_and_mentions(caption)
-        caption_text = f"📄 Caption:\n{caption or '(yo‘q)'}\n\n🏷 Hashtags: {' '.join(hashtags) if hashtags else 'Yo‘q'}\n👤 Mentions: {' '.join(mentions) if mentions else 'Yo‘q'}"
+        caption_text = (
+            f"📄 Caption:\n{info['caption'] or '(yo‘q)'}\n\n"
+            f"🏷 Hashtags: {' '.join(info['hashtags']) if info['hashtags'] else 'Yo‘q'}\n"
+            f"👤 Mentions: {' '.join(info['mentions']) if info['mentions'] else 'Yo‘q'}"
+        )
 
-        # Send media first
-        if info.media_type == 2:  # video
-            await update.message.reply_video(video=str(info.video_url))
-        elif info.media_type == 1:  # photo
-            await update.message.reply_photo(photo=str(info.thumbnail_url))
-        elif info.media_type == 8:  # album
-            for res in info.resources:
-                if res.media_type == 2:
-                    await update.message.reply_video(video=str(res.video_url))
-                elif res.media_type == 1:
-                    await update.message.reply_photo(photo=str(res.thumbnail_url))
+        if info["media_type"] == "photo":
+            await update.message.reply_photo(photo=info["media_urls"][0])
+        elif info["media_type"] == "video":
+            await update.message.reply_video(video=info["media_urls"][0])
+        elif info["media_type"] == "album":
+            for media_url in info["media_urls"]:
+                if media_url.endswith(('.mp4', '.mov')):
+                    await update.message.reply_video(video=media_url)
+                else:
+                    await update.message.reply_photo(photo=media_url)
         else:
-            await update.message.reply_text("❌ Noma'lum media turi. Faqat rasm/video/album qo‘llanadi.")
+            await update.message.reply_text("❌ Media topilmadi yoki qo‘llab-quvvatlanmaydi.")
 
-        # Send caption + tags
         await update.message.reply_text(caption_text)
         await msg.delete()
 
