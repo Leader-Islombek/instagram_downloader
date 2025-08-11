@@ -1,5 +1,4 @@
 python-telegram-bot==20.3
-sqlalchemy==2.0.20
-asyncpg==0.29.0
-python-dotenv==1.0.0
-requests==2.31.0
+instagrapi
+psycopg2-binary
+python-dotenv
