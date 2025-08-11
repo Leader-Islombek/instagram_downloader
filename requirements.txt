@@ -2,3 +2,4 @@ python-telegram-bot==20.3
 instagrapi
 psycopg2-binary
 python-dotenv
+instaloader
